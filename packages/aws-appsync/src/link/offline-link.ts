@@ -7,13 +7,14 @@
  * KIND, express or implied. See the License for the specific language governing permissions and limitations under the License.
  */
 import { readQueryFromStore, defaultNormalizedCacheFactory } from "apollo-cache-inmemory";
-import { ApolloLink, Observable, Operation } from "apollo-link";
+import { ApolloLink, execute, Observable, Operation } from "apollo-link";
 import { getOperationDefinition, getOperationName, getMutationDefinition, resultKeyNameFromField } from "apollo-utilities";
 import { PERSIST_REHYDRATE } from "@redux-offline/redux-offline/lib/constants";
 import { DocumentNode, FieldNode } from "graphql";
 
 import { NORMALIZED_CACHE_KEY, METADATA_KEY } from "../cache";
 import { AWSAppsyncGraphQLError } from "../types";
+import { offline } from "@redux-offline/redux-offline";
 
 const actions = {
     SAVE_SNAPSHOT: 'SAVE_SNAPSHOT',
@@ -68,35 +69,41 @@ export class OfflineLink extends ApolloLink {
                         }
                     }
 
-                    const data = enqueueMutation(operation, this.store);
+                    const data = enqueueMutation(operation, this.store, observer);
 
                     observer.next({ data });
-                    observer.complete();
+                    // This 
+                    if (!online) {
+                        observer.complete();
+                    }
 
                     return () => null;
                 }
             }
 
+            debugger;
             const handle = forward(operation).subscribe({
                 next: data => {
+                    debugger;
                     if (isMutation) {
-                        const { cache, AASContext: { client } } = operation.getContext();
+                        // const { cache, AASContext: { client } } = operation.getContext();
 
-                        if (client && client.queryManager) {
-                            const { [METADATA_KEY]: { snapshot: { cache: cacheSnapshot } } } = this.store.getState();
+                        // if (client && client.queryManager) {
+                        //     const { [METADATA_KEY]: { snapshot: { cache: cacheSnapshot } } } = this.store.getState();
 
-                            client.queryManager.broadcastQueries = () => { };
+                        //     client.queryManager.broadcastQueries = () => { };
 
-                            const silenceBroadcast = cache.silenceBroadcast;
-                            cache.silenceBroadcast = true;
+                        //     const silenceBroadcast = cache.silenceBroadcast;
+                        //     cache.silenceBroadcast = true;
 
-                            cache.restore({ ...cacheSnapshot });
+                        //     cache.restore({ ...cacheSnapshot });
 
-                            cache.silenceBroadcast = silenceBroadcast;
-                        }
+                        //     cache.silenceBroadcast = silenceBroadcast;
+                        // }
                     }
 
                     observer.next(data);
+                    observer.complete();
                 },
                 error: observer.error.bind(observer),
                 complete: observer.complete.bind(observer),
@@ -138,8 +145,9 @@ const processOfflineQuery = (operation, theStore) => {
  *
  * @param {Operation} operation
  * @param {Store} theStore
+ * @param {Observable} observer
  */
-const enqueueMutation = (operation, theStore): object => {
+const enqueueMutation = (operation, theStore, observer): object => {
     const { query: mutation, variables } = operation;
     const { optimisticResponse,
         AASContext: { refetchQueries = undefined, update = undefined } = {}
@@ -157,6 +165,8 @@ const enqueueMutation = (operation, theStore): object => {
                         refetchQueries,
                         update,
                         optimisticResponse,
+                        observer,
+                        operation
                     },
                     commit: { type: actions.COMMIT, meta: { optimisticResponse } },
                     rollback: { type: actions.ROLLBACK },
@@ -190,9 +200,9 @@ const enqueueMutation = (operation, theStore): object => {
  */
 export const offlineEffect = (store, client, effect, action) => {
     const doIt = true;
-    const { variables: origVars = {}, optimisticResponse: origOptimistic, ...otherOptions } = effect;
+    const { variables: origVars = {}, optimisticResponse: origOptimistic, observer, operation, ...otherOptions } = effect;
 
-    const context = { AASContext: { doIt } };
+    const context = { AASContext: { doIt, observer } };
 
     const { [METADATA_KEY]: { idsMap } } = store.getState();
     const variables = replaceUsingMap({ ...origVars }, idsMap);
@@ -205,7 +215,48 @@ export const offlineEffect = (store, client, effect, action) => {
         context,
     };
 
-    return client.mutate(options);
+    // Create mutation operation
+    debugger;
+    // const x = client.hydrated().then(client => client.queryManager.mutate(options)
+    //     .then(data => {
+    //         debugger;
+    //         if (observer.next) {
+    //             observer.next(data);
+    //             observer.complete();
+    //         }
+
+    //         return data;
+    //     }).catch(err => {
+    //         debugger;
+    //         if (observer.error) {
+    //             observer.error(err);
+    //         }
+
+    //         throw err;
+    //     }));
+
+    // debugger;
+    // return x;
+    let result;
+    return new Promise((res, rej) => {
+        execute(client.queryManager.link, {
+            ...operation,
+            context,
+        }).subscribe({
+            next: data => {
+                result = data;
+                observer.next && observer.next(data);
+            },
+            error: err => {
+                observer.error && observer.error(err);
+                rej(err);
+            },
+            complete: () => {
+                observer.complete && observer.complete();
+                res(result);
+            }
+        })
+    });
 }
 
 export const reducer = dataIdFromObject => ({
